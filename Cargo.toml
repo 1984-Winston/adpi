@@ -11,6 +11,13 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0.86"
 clap = { version = "4.5.16", features = ["derive"] }
+libc = "0.2.158"
+linux-raw-sys = { version = "0.6.5", features = ["net"] }
 socket2 = "0.5.7"
 tls-parser = "0.11.0"
-tokio = { version = "1.39.3", features = ["net", "io-util", "rt-multi-thread"] }
+tokio = { version = "1.39.3", features = [
+    "net",
+    "time",
+    "io-util",
+    "rt-multi-thread",
+] }

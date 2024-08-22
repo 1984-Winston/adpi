@@ -1,11 +1,14 @@
 use std::{
+    mem::MaybeUninit,
     net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
+    os::fd::AsRawFd,
     str::FromStr,
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use linux_raw_sys::net::tcp_info;
 use socket2::{Domain, Socket, Type};
 use tls_parser::{
     parse_tls_client_hello_extensions, parse_tls_plaintext, SNIType, TlsExtension, TlsMessage,
@@ -17,6 +20,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
+    time,
 };
 
 #[derive(Parser, Debug)]
@@ -56,7 +60,7 @@ fn main() -> Result<()> {
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.threads)
-        .enable_io()
+        .enable_all()
         .build()?
         .block_on(_main(args))
 }
@@ -89,9 +93,45 @@ async fn _main(args: Args) -> Result<()> {
     }
 }
 
+fn get_tcp_info(fd: i32) -> Result<tcp_info> {
+    unsafe {
+        let mut payload: MaybeUninit<tcp_info> = MaybeUninit::uninit();
+        let mut len = size_of::<tcp_info>() as libc::socklen_t;
+
+        if libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            payload.as_mut_ptr().cast(),
+            &mut len,
+        ) == 0
+        {
+            let payload = payload.assume_init();
+            Ok(payload)
+        } else {
+            Err(anyhow!("getsockopt failed"))
+        }
+    }
+}
+
+async fn really_flush(writer: &mut OwnedWriteHalf, fd: i32) -> Result<()> {
+    writer.flush().await?;
+
+    let mut timeout = 1;
+    while get_tcp_info(fd)?.tcpi_notsent_bytes > 0 {
+        time::sleep(time::Duration::from_millis(timeout)).await;
+        if timeout <= 8 {
+            timeout *= 2;
+        }
+    }
+
+    Ok(())
+}
+
 async fn copy_stream(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
+    fd: i32,
     args: Arc<Args>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 4096];
@@ -149,7 +189,7 @@ async fn copy_stream(
         for split_at in &split_positions {
             writer.write_all(&buf[start_byte..*split_at]).await?;
             if split_positions.len() > 1 && *split_at != read_bytes {
-                writer.flush().await?;
+                really_flush(&mut writer, fd).await?;
             }
             start_byte = *split_at;
         }
@@ -178,15 +218,24 @@ async fn handle_client(
     if let Some(fwmark) = args.fwmark {
         dst_socket.set_mark(fwmark)?;
     }
+    dst_socket.set_send_buffer_size(0)?;
     dst_socket.connect(&original_dst.into()).ok();
     let std_stream: StdTcpStream = dst_socket.into();
     let server_stream = TcpStream::from_std(std_stream)?;
 
+    let server_fd = server_stream.as_raw_fd();
+    let client_fd = client_stream.as_raw_fd();
+
     let (client_reader, client_writer) = client_stream.into_split();
     let (server_reader, server_writer) = server_stream.into_split();
 
-    tokio::spawn(copy_stream(client_reader, server_writer, Arc::clone(&args)));
-    tokio::spawn(copy_stream(server_reader, client_writer, args));
+    tokio::spawn(copy_stream(
+        client_reader,
+        server_writer,
+        server_fd,
+        Arc::clone(&args),
+    ));
+    tokio::spawn(copy_stream(server_reader, client_writer, client_fd, args));
 
     Ok(())
 }
