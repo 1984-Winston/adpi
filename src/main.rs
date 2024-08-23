@@ -120,7 +120,7 @@ async fn really_flush(writer: &mut OwnedWriteHalf, fd: i32) -> Result<()> {
     let mut timeout = 1;
     while get_tcp_info(fd)?.tcpi_notsent_bytes > 0 {
         time::sleep(time::Duration::from_millis(timeout)).await;
-        if timeout <= 8 {
+        if timeout < 8 {
             timeout *= 2;
         }
     }
@@ -128,13 +128,13 @@ async fn really_flush(writer: &mut OwnedWriteHalf, fd: i32) -> Result<()> {
     Ok(())
 }
 
-async fn copy_stream(
+async fn client_to_server(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     fd: i32,
     args: Arc<Args>,
 ) -> Result<()> {
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 8192];
     let mut split_positions = Vec::with_capacity(8);
 
     loop {
@@ -199,6 +199,11 @@ async fn copy_stream(
     Ok(())
 }
 
+async fn server_to_client(mut reader: OwnedReadHalf, mut writer: OwnedWriteHalf) -> Result<()> {
+    tokio::io::copy(&mut reader, &mut writer).await?;
+    Ok(())
+}
+
 async fn handle_client(
     client_stream: TcpStream,
     client_addr: SocketAddr,
@@ -214,28 +219,26 @@ async fn handle_client(
     };
     let dst_socket = Socket::new(dst_domain, Type::STREAM, None)?;
     dst_socket.set_reuse_address(true)?;
-    dst_socket.set_nonblocking(true)?;
     if let Some(fwmark) = args.fwmark {
         dst_socket.set_mark(fwmark)?;
     }
-    dst_socket.set_send_buffer_size(0)?;
+    dst_socket.set_nonblocking(true)?;
     dst_socket.connect(&original_dst.into()).ok();
     let std_stream: StdTcpStream = dst_socket.into();
     let server_stream = TcpStream::from_std(std_stream)?;
 
     let server_fd = server_stream.as_raw_fd();
-    let client_fd = client_stream.as_raw_fd();
 
     let (client_reader, client_writer) = client_stream.into_split();
     let (server_reader, server_writer) = server_stream.into_split();
 
-    tokio::spawn(copy_stream(
+    tokio::spawn(client_to_server(
         client_reader,
         server_writer,
         server_fd,
         Arc::clone(&args),
     ));
-    tokio::spawn(copy_stream(server_reader, client_writer, client_fd, args));
+    tokio::spawn(server_to_client(server_reader, client_writer));
 
     Ok(())
 }
