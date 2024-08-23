@@ -1,8 +1,7 @@
 use std::{
-    mem::MaybeUninit,
+    mem::{size_of, MaybeUninit},
     net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
     os::fd::AsRawFd,
-    str::FromStr,
     sync::Arc,
 };
 
@@ -30,17 +29,9 @@ struct Args {
     #[arg(short = 't', long, default_value_t = 4)]
     threads: usize,
 
-    /// Socket address to bind listener
-    #[arg(short = 'l', long, default_value = "127.0.0.1:1280")]
-    listen_address: String,
-
-    /// Rx buffer size
-    #[arg(short = 'r', long, default_value_t = 32 * 1024)]
-    rx_buffer_size: usize,
-
-    /// Socket listen backlog
-    #[arg(short = 'b', long, default_value_t = 1024)]
-    listen_backlog: i32,
+    /// Socket addresses to bind listeners
+    #[arg(short = 'l', long, default_values = ["127.0.0.1:1280", "[::1]:1280"])]
+    listen_address: Vec<SocketAddr>,
 
     /// Split positions in TLS ClientHello message
     #[arg(short = 'c', long)]
@@ -50,47 +41,68 @@ struct Args {
     #[arg(short = 's', long, default_value_t = false)]
     split_host: bool,
 
-    /// Set fwmark
-    #[arg(short = 'f', long)]
-    fwmark: Option<u32>,
+    /// Set fwmark for outgoing sockets. Disabled if 0.
+    #[arg(short = 'm', long, default_value_t = 1280)]
+    fwmark: u32,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads)
-        .enable_all()
-        .build()?
-        .block_on(_main(args))
+    if args.threads > 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(_main(args))
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(args.threads)
+            .enable_all()
+            .build()?
+            .block_on(_main(args))
+    }
 }
 
 async fn _main(args: Args) -> Result<()> {
-    let listen_addr = SocketAddr::from_str(&args.listen_address)?;
+    let args = Arc::new(args);
 
-    let domain = if listen_addr.is_ipv4() {
+    for addr in &args.listen_address {
+        let listener = make_listener(*addr)?;
+        println!("listening on {addr}");
+
+        let args = Arc::clone(&args);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((client_stream, client_addr)) = listener.accept().await {
+                    tokio::spawn(handle_client(client_stream, client_addr, Arc::clone(&args)));
+                }
+            }
+        });
+    }
+
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+fn make_listener(addr: SocketAddr) -> Result<TcpListener> {
+    let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
     };
 
     let listen_socket = Socket::new(domain, Type::STREAM, None)?;
-    listen_socket.set_reuse_address(true)?;
     listen_socket.set_nonblocking(true)?;
+    listen_socket.set_cloexec(true)?;
+    listen_socket.set_reuse_address(true)?;
+    listen_socket.set_nodelay(true)?;
     listen_socket.set_ip_transparent(true)?;
-    listen_socket.set_recv_buffer_size(args.rx_buffer_size)?;
-    listen_socket.bind(&listen_addr.into())?;
-    listen_socket.listen(args.listen_backlog)?;
+    listen_socket.bind(&addr.into())?;
+    listen_socket.listen(1024)?;
 
     let std_listener: StdTcpListener = listen_socket.into();
     let listener = TcpListener::from_std(std_listener)?;
-
-    let args = Arc::new(args);
-    loop {
-        if let Ok((client_stream, client_addr)) = listener.accept().await {
-            tokio::spawn(handle_client(client_stream, client_addr, Arc::clone(&args)));
-        }
-    }
+    Ok(listener)
 }
 
 fn get_tcp_info(fd: i32) -> Result<tcp_info> {
@@ -209,6 +221,7 @@ async fn handle_client(
     client_addr: SocketAddr,
     args: Arc<Args>,
 ) -> Result<()> {
+    client_stream.set_nodelay(true)?;
     let (client_stream, original_dst) = get_original_dst(client_stream)?;
     eprintln!("{client_addr} -> {original_dst}");
 
@@ -218,11 +231,13 @@ async fn handle_client(
         Domain::IPV6
     };
     let dst_socket = Socket::new(dst_domain, Type::STREAM, None)?;
-    dst_socket.set_reuse_address(true)?;
-    if let Some(fwmark) = args.fwmark {
-        dst_socket.set_mark(fwmark)?;
-    }
     dst_socket.set_nonblocking(true)?;
+    dst_socket.set_cloexec(true)?;
+    dst_socket.set_reuse_address(true)?;
+    dst_socket.set_nodelay(true)?;
+    if args.fwmark != 0 {
+        dst_socket.set_mark(args.fwmark)?;
+    }
     dst_socket.connect(&original_dst.into()).ok();
     let std_stream: StdTcpStream = dst_socket.into();
     let server_stream = TcpStream::from_std(std_stream)?;
